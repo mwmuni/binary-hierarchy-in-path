@@ -1,0 +1,12 @@
+[package]
+name = "path-tree"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winsafe = { version = "0.0.25", features = ["gui", "user", "kernel"] }
+clap = { version = "4.5", features = ["derive"] }
+owo-colors = "4"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.51"
