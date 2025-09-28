@@ -373,6 +373,8 @@ fn populate_tree_from_state(tv: &gui::TreeView<String>, state: &AppState) -> Any
 }
 
 fn main() -> AnyResult<()> {
+    // Set DPI awareness for proper scaling on high-DPI displays
+    winsafe::SetProcessDPIAware()?;
 
     // initial scope: User only (requested default)
     let scope_state = RegistryScope::UserOnly;
