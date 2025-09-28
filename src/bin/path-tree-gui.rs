@@ -139,6 +139,37 @@ fn build_tree_data_with_scope(scope: RegistryScope) -> (
     (expanded_paths, original_paths, dir_bins, seen, all_dirs, bin_dir_map_list, duplicates)
 }
 
+/// Identify which PATH entries are redundant (all their binaries are duplicates/overridden).
+/// Returns a vector of indices of redundant entries.
+fn find_redundant_entries(
+    dir_bins: &[Vec<OsString>],
+    seen: &HashMap<String, usize>,
+) -> Vec<usize> {
+    let mut redundant = Vec::new();
+    for (i, bins) in dir_bins.iter().enumerate() {
+        if bins.is_empty() {
+            // Empty entries are redundant
+            redundant.push(i);
+            continue;
+        }
+        let mut all_overridden = true;
+        for b in bins {
+            let b_str = b.to_string_lossy().to_string();
+            if let Some(first_idx) = seen.get(&b_str) {
+                if *first_idx == i {
+                    // This binary is first seen here, so this entry provides unique value
+                    all_overridden = false;
+                    break;
+                }
+            }
+        }
+        if all_overridden {
+            redundant.push(i);
+        }
+    }
+    redundant
+}
+
 #[derive(Clone)]
 struct AppState {
     scope: RegistryScope,
@@ -407,7 +438,7 @@ fn main() -> AnyResult<()> {
     // Create main window
     let wnd_opts = gui::WindowMainOpts {
         title: "Path Tree".into(),
-        size: gui::dpi(800, 600),
+        size: gui::dpi(970, 600),
         ..Default::default()
     };
     let wnd = gui::WindowMain::new(wnd_opts);
@@ -484,6 +515,27 @@ fn main() -> AnyResult<()> {
         height: gui::dpi_y(20),
         ..Default::default()
     });
+    let btn_remove_dup = gui::Button::new(&wnd, gui::ButtonOpts {
+        text: "Rm Dup".into(),
+        position: gui::dpi(798, 6),
+        width: gui::dpi_x(50),
+        height: gui::dpi_y(20),
+        ..Default::default()
+    });
+    let btn_export_path = gui::Button::new(&wnd, gui::ButtonOpts {
+        text: "Export".into(),
+        position: gui::dpi(852, 6),
+        width: gui::dpi_x(50),
+        height: gui::dpi_y(20),
+        ..Default::default()
+    });
+    let btn_import_path = gui::Button::new(&wnd, gui::ButtonOpts {
+        text: "Import".into(),
+        position: gui::dpi(906, 6),
+        width: gui::dpi_x(50),
+        height: gui::dpi_y(20),
+        ..Default::default()
+    });
     let tv_opts = gui::TreeViewOpts {
     position: gui::dpi(0, 32),
     size: gui::dpi(400, 548),
@@ -494,7 +546,7 @@ fn main() -> AnyResult<()> {
     let edit_opts = gui::EditOpts {
         text: String::new(),
     position: gui::dpi(400, 32),
-    width: gui::dpi_x(400),
+    width: gui::dpi_x(570),
     height: gui::dpi_y(548),
         control_style: co::ES::MULTILINE | co::ES::WANTRETURN | co::ES::AUTOVSCROLL,
         ..Default::default()
@@ -1055,6 +1107,286 @@ fn main() -> AnyResult<()> {
                 let _ = status_ps.set_text(&format!("PowerShell: cd {}", dir));
             } else {
                 let _ = status_ps.set_text("Cannot open PowerShell here (path missing)");
+            }
+            Ok(())
+        });
+
+        // Remove duplicates button
+        let state_rm = state.clone();
+        let tv_rm = tv.clone();
+        let status_rm = status.clone();
+        let wnd_rm = wnd.clone();
+        btn_remove_dup.on().bn_clicked(move || -> AnyResult<()> {
+            let redundant = find_redundant_entries(&state_rm.borrow().dir_bins, &state_rm.borrow().seen);
+            if redundant.is_empty() {
+                let _ = status_rm.set_text("No redundant entries found");
+                return Ok(());
+            }
+
+            // Show confirmation dialog using Windows API
+            let scope_name = match state_rm.borrow().scope {
+                RegistryScope::UserOnly => "User",
+                RegistryScope::SystemOnly => "System", 
+                RegistryScope::ProcessOnly => "Process",
+                _ => "Unknown",
+            };
+            
+            use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MESSAGEBOX_STYLE, MB_ICONWARNING, MB_YESNO};
+            
+            let title = "Confirm PATH Modification";
+            let message = format!(
+                "This will remove {} redundant PATH entries from the {} scope.\n\n\
+                WARNING: This modifies your system's PATH environment variable.\n\
+                It is recommended to backup your PATH before proceeding.\n\n\
+                Do you want to continue?",
+                redundant.len(), scope_name
+            );
+            
+            // Convert strings to UTF-16
+            let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+            let message_wide: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+            
+            let result = unsafe {
+                MessageBoxW(
+                    windows::Win32::Foundation::HWND(wnd_rm.hwnd().ptr() as _),
+                    windows::core::PCWSTR(message_wide.as_ptr()),
+                    windows::core::PCWSTR(title_wide.as_ptr()),
+                    MESSAGEBOX_STYLE(MB_YESNO.0 | MB_ICONWARNING.0),
+                )
+            };
+            
+            if result.0 != 6 { // IDYES = 6
+                let _ = status_rm.set_text("Operation cancelled");
+                return Ok(());
+            }
+
+            // Build new PATH by removing redundant entries
+            let mut new_entries = Vec::new();
+            for (i, orig) in state_rm.borrow().orig_paths.iter().enumerate() {
+                if !redundant.contains(&i) {
+                    new_entries.push(orig.clone());
+                }
+            }
+            let new_path = new_entries.join(";");
+
+            // Set the new PATH
+            if path_tree::path_utils::set_path_string_for_scope(state_rm.borrow().scope, &new_path) {
+                let _ = status_rm.set_text(&format!("Removed {} redundant entries", redundant.len()));
+                // Refresh the tree
+                state_rm.borrow_mut().rebuild();
+                populate_tree_from_state(&tv_rm, &*state_rm.borrow())?;
+                set_window_title_with_stats(&wnd_rm, &*state_rm.borrow())?;
+                set_status_bar(&status_rm, &*state_rm.borrow())?;
+            } else {
+                let _ = status_rm.set_text("Failed to update PATH");
+            }
+            Ok(())
+        });
+
+        // Export PATH button
+        let state_exp = state.clone();
+        let status_exp = status.clone();
+        btn_export_path.on().bn_clicked(move || -> AnyResult<()> {
+            let scope_name = match state_exp.borrow().scope {
+                RegistryScope::UserOnly => "User",
+                RegistryScope::SystemOnly => "System", 
+                RegistryScope::ProcessOnly => "Process",
+                _ => "Unknown",
+            };
+
+            // Get current PATH
+            let current_path = match path_tree::path_utils::get_path_string_for_scope(state_exp.borrow().scope) {
+                Some(path) => path,
+                None => {
+                    // Show error dialog
+                    let message = "Failed to retrieve the current PATH for export.";
+                    let title = "Export Failed";
+                    let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+                    let message_wide: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+                    
+                    let _ = unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                            windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+                            windows::core::PCWSTR(message_wide.as_ptr()),
+                            windows::core::PCWSTR(title_wide.as_ptr()),
+                            windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE(
+                                windows::Win32::UI::WindowsAndMessaging::MB_OK.0 | 
+                                windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR.0
+                            ),
+                        )
+                    };
+                    
+                    let _ = status_exp.set_text("Failed to get current PATH");
+                    return Ok(());
+                }
+            };
+
+            // Create default filename with timestamp
+            let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+            let filename = format!("PATH_{}_{}.txt", scope_name, timestamp);
+            
+            // Get user's documents folder
+            let documents_path = match std::env::var("USERPROFILE") {
+                Ok(profile) => std::path::PathBuf::from(profile).join("Documents").join(&filename),
+                Err(_) => std::path::PathBuf::from(&filename),
+            };
+
+            // Write PATH to file
+            match std::fs::write(&documents_path, &current_path) {
+                Ok(_) => {
+                    // Show success dialog with option to open in Explorer
+                    let message = format!(
+                        "PATH successfully exported!\n\n\
+                        Saved to: {}\n\n\
+                        Do you want to open the file location in Explorer?",
+                        documents_path.display()
+                    );
+                    
+                    let title = "Export Successful";
+                    let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+                    let message_wide: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+                    
+                    let result = unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                            windows::Win32::Foundation::HWND(std::ptr::null_mut()), // Use desktop as parent for better visibility
+                            windows::core::PCWSTR(message_wide.as_ptr()),
+                            windows::core::PCWSTR(title_wide.as_ptr()),
+                            windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE(
+                                windows::Win32::UI::WindowsAndMessaging::MB_YESNO.0 | 
+                                windows::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION.0
+                            ),
+                        )
+                    };
+                    
+                    if result.0 == 6 { // IDYES
+                        // Open in Explorer
+                        let _ = std::process::Command::new("explorer")
+                            .args(["/select,", &documents_path.to_string_lossy()])
+                            .spawn();
+                    }
+                    
+                    let _ = status_exp.set_text(&format!("PATH exported to {}", documents_path.display()));
+                }
+                Err(e) => {
+                    // Show error dialog
+                    let message = format!("Failed to export PATH:\n\n{}", e);
+                    let title = "Export Failed";
+                    let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+                    let message_wide: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+                    
+                    let _ = unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                            windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+                            windows::core::PCWSTR(message_wide.as_ptr()),
+                            windows::core::PCWSTR(title_wide.as_ptr()),
+                            windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE(
+                                windows::Win32::UI::WindowsAndMessaging::MB_OK.0 | 
+                                windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR.0
+                            ),
+                        )
+                    };
+                    
+                    let _ = status_exp.set_text(&format!("Export failed: {}", e));
+                }
+            }
+            Ok(())
+        });
+
+        // Import PATH button
+        let state_imp = state.clone();
+        let tv_imp = tv.clone();
+        let status_imp = status.clone();
+        let wnd_imp = wnd.clone();
+        btn_import_path.on().bn_clicked(move || -> AnyResult<()> {
+            let scope_name = match state_imp.borrow().scope {
+                RegistryScope::UserOnly => "User",
+                RegistryScope::SystemOnly => "System", 
+                RegistryScope::ProcessOnly => "Process",
+                _ => "Unknown",
+            };
+
+            // For simplicity, look for the most recent PATH backup file
+            let documents_path = match std::env::var("USERPROFILE") {
+                Ok(profile) => std::path::PathBuf::from(profile).join("Documents"),
+                Err(_) => std::path::PathBuf::from("."),
+            };
+
+            let mut latest_file: Option<std::path::PathBuf> = None;
+            let mut latest_time = std::time::SystemTime::UNIX_EPOCH;
+
+            if let Ok(entries) = std::fs::read_dir(&documents_path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                        if filename.starts_with(&format!("PATH_{}_", scope_name)) && filename.ends_with(".txt") {
+                            if let Ok(metadata) = entry.metadata() {
+                                if let Ok(modified) = metadata.modified() {
+                                    if modified > latest_time {
+                                        latest_time = modified;
+                                        latest_file = Some(path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let file_path = match latest_file {
+                Some(path) => path,
+                None => {
+                    let _ = status_imp.set_text(&format!("No {} PATH backup files found in Documents folder", scope_name));
+                    return Ok(());
+                }
+            };
+
+            // Read PATH from file
+            match std::fs::read_to_string(&file_path) {
+                Ok(content) => {
+                    // Show confirmation dialog
+                    let message = format!(
+                        "This will replace the current {} PATH with the content from:\n{}\n\n\
+                        WARNING: This will overwrite your current PATH settings.\n\
+                        Make sure you have a backup!\n\n\
+                        Do you want to continue?",
+                        scope_name, file_path.display()
+                    );
+                    
+                    let title = "Confirm PATH Import";
+                    let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+                    let message_wide: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+                    
+                    let result = unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                            windows::Win32::Foundation::HWND(wnd_imp.hwnd().ptr() as _),
+                            windows::core::PCWSTR(message_wide.as_ptr()),
+                            windows::core::PCWSTR(title_wide.as_ptr()),
+                            windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE(
+                                windows::Win32::UI::WindowsAndMessaging::MB_YESNO.0 | 
+                                windows::Win32::UI::WindowsAndMessaging::MB_ICONWARNING.0
+                            ),
+                        )
+                    };
+                    
+                    if result.0 == 6 { // IDYES
+                        // Apply the PATH
+                        if path_tree::path_utils::set_path_string_for_scope(state_imp.borrow().scope, &content.trim()) {
+                            let _ = status_imp.set_text(&format!("PATH imported from {}", file_path.display()));
+                            // Refresh the tree
+                            state_imp.borrow_mut().rebuild();
+                            populate_tree_from_state(&tv_imp, &*state_imp.borrow())?;
+                            set_window_title_with_stats(&wnd_imp, &*state_imp.borrow())?;
+                            set_status_bar(&status_imp, &*state_imp.borrow())?;
+                        } else {
+                            let _ = status_imp.set_text("Failed to update PATH");
+                        }
+                    } else {
+                        let _ = status_imp.set_text("Import cancelled");
+                    }
+                }
+                Err(e) => {
+                    let _ = status_imp.set_text(&format!("Failed to read file: {}", e));
+                }
             }
             Ok(())
         });

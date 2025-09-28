@@ -309,6 +309,49 @@ pub fn get_path_string_for_scope(scope: RegistryScope) -> Option<String> {
     }
 }
 
+/// Set the PATH string according to the given scope.
+/// - ProcessOnly: sets current process PATH.
+/// - UserOnly: writes HKCU\Environment Path on Windows.
+/// - SystemOnly: writes HKLM...Session Manager\Environment Path on Windows.
+/// Returns true if successful.
+pub fn set_path_string_for_scope(scope: RegistryScope, new_path: &str) -> bool {
+    match scope {
+        RegistryScope::ProcessOnly => {
+            env::set_var("PATH", new_path);
+            true
+        }
+        RegistryScope::UserOnly => {
+            #[cfg(windows)]
+            {
+                use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
+                use winreg::{RegKey};
+                let root = RegKey::predef(HKEY_CURRENT_USER);
+                if let Ok(key) = root.open_subkey_with_flags("Environment", KEY_SET_VALUE) {
+                    return key.set_value("Path", &new_path.to_string()).is_ok();
+                }
+                false
+            }
+            #[cfg(not(windows))]
+            { false }
+        }
+        RegistryScope::SystemOnly => {
+            #[cfg(windows)]
+            {
+                use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_SET_VALUE};
+                use winreg::{RegKey};
+                let root = RegKey::predef(HKEY_LOCAL_MACHINE);
+                if let Ok(key) = root.open_subkey_with_flags(r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", KEY_SET_VALUE) {
+                    return key.set_value("Path", &new_path.to_string()).is_ok();
+                }
+                false
+            }
+            #[cfg(not(windows))]
+            { false }
+        }
+        _ => false, // Combined scopes not supported for setting
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{expand_env_vars, expand_env_vars_with_info_lookup, VarLookup};
