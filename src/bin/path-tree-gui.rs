@@ -139,32 +139,26 @@ fn build_tree_data_with_scope(scope: RegistryScope) -> (
     (expanded_paths, original_paths, dir_bins, seen, all_dirs, bin_dir_map_list, duplicates)
 }
 
-/// Identify which PATH entries are redundant (all their binaries are duplicates/overridden).
+/// Identify which PATH entries are redundant (duplicate resolved paths).
 /// Returns a vector of indices of redundant entries.
 fn find_redundant_entries(
-    dir_bins: &[Vec<OsString>],
-    seen: &HashMap<String, usize>,
+    resolved_paths: &[Option<PathBuf>],
 ) -> Vec<usize> {
     let mut redundant = Vec::new();
-    for (i, bins) in dir_bins.iter().enumerate() {
-        if bins.is_empty() {
-            // Empty entries are redundant
-            redundant.push(i);
-            continue;
-        }
-        let mut all_overridden = true;
-        for b in bins {
-            let b_str = b.to_string_lossy().to_string();
-            if let Some(first_idx) = seen.get(&b_str) {
-                if *first_idx == i {
-                    // This binary is first seen here, so this entry provides unique value
-                    all_overridden = false;
-                    break;
+    let mut seen_paths = std::collections::HashSet::new();
+    
+    for (i, resolved_path) in resolved_paths.iter().enumerate() {
+        match resolved_path {
+            Some(path) => {
+                // If we've seen this resolved path before, mark as redundant
+                if !seen_paths.insert(path.clone()) {
+                    redundant.push(i);
                 }
             }
-        }
-        if all_overridden {
-            redundant.push(i);
+            None => {
+                // Unresolved entries are redundant
+                redundant.push(i);
+            }
         }
     }
     redundant
@@ -1117,7 +1111,7 @@ fn main() -> AnyResult<()> {
         let status_rm = status.clone();
         let wnd_rm = wnd.clone();
         btn_remove_dup.on().bn_clicked(move || -> AnyResult<()> {
-            let redundant = find_redundant_entries(&state_rm.borrow().dir_bins, &state_rm.borrow().seen);
+            let redundant = find_redundant_entries(&state_rm.borrow().paths);
             if redundant.is_empty() {
                 let _ = status_rm.set_text("No redundant entries found");
                 return Ok(());
@@ -1135,7 +1129,8 @@ fn main() -> AnyResult<()> {
             
             let title = "Confirm PATH Modification";
             let message = format!(
-                "This will remove {} redundant PATH entries from the {} scope.\n\n\
+                "This will remove {} duplicate PATH entries from the {} scope.\n\
+                Duplicate entries are those that resolve to the same directory as an earlier entry.\n\n\
                 WARNING: This modifies your system's PATH environment variable.\n\
                 It is recommended to backup your PATH before proceeding.\n\n\
                 Do you want to continue?",
