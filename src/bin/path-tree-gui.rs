@@ -2,12 +2,15 @@ use std::ffi::OsString;
 use std::fs;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::rc::Rc;
 use std::cell::RefCell;
 use winsafe::prelude::*;
 use winsafe::{gui, AnyResult, co};
+use windows::Win32::UI::WindowsAndMessaging::{CreatePopupMenu, AppendMenuW, TrackPopupMenuEx, GetCursorPos, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON};
+use windows::Win32::Foundation::POINT;
+use windows::core::PCWSTR;
 use winsafe::msg;
 use path_tree::path_utils::{expand_env_vars_with_scope, RegistryScope, get_path_string_for_scope};
 
@@ -27,9 +30,9 @@ fn strip_child_label(s: &str) -> String {
 fn strip_root_label(mut s: &str) -> String {
     if let Some(t) = s.strip_suffix(" ⚠") { s = t; }
     if let Some(t) = s.strip_suffix(" ★") { s = t; }
-    if let Some(t) = s.strip_suffix(" ★") { s = t; }
-    if let Some(t) = s.strip_suffix(" ⚠") { s = t; }
+    if let Some(t) = s.strip_suffix(" ♦") { s = t; }
     if let Some(t) = s.strip_prefix("🟢 ") { return t.to_string(); }
+    if let Some(t) = s.strip_prefix("🟡 ") { return t.to_string(); }
     if let Some(t) = s.strip_prefix("🔴 ") { return t.to_string(); }
     s.to_string()
 }
@@ -377,10 +380,14 @@ fn populate_tree_from_state(tv: &gui::TreeView<String>, state: &AppState) -> Any
             }
         }
     // Color prefix semantics:
-    // - 🔴 red: non-existent/unresolved root dir
     // - 🟡 yellow: has overridden binaries
+    // - 🔴 red: non-existent/unresolved root dir
     // - 🟢 green: existing root dir
-    let color_prefix = if unresolved { "🔴 " } else if has_overridden { "🟡 " } else { "🟢 " };
+    let color_prefix = match (has_overridden, unresolved) {
+        (true, _) => "🟡 ",
+        (false, true) => "🔴 ",
+        (false, false) => "🟢 ",
+    };
     let mut root_label = format!("{}{}", color_prefix, base_root);
     if has_duplicates {
         if has_first { root_label.push_str(" ★"); }
@@ -421,6 +428,141 @@ fn populate_tree_from_state(tv: &gui::TreeView<String>, state: &AppState) -> Any
     Ok(())
 }
 
+fn prioritise_entry(state: &Rc<RefCell<AppState>>, selected_idx: usize) {
+    let mut state_mut = state.borrow_mut();
+    
+    // Get the binaries provided by the selected entry
+    let selected_binaries = match state_mut.bin_dir_map.get(selected_idx) {
+        Some(map) => map.keys().cloned().collect::<HashSet<_>>(),
+        None => return, // No binaries to prioritise
+    };
+    
+    if selected_binaries.is_empty() {
+        return;
+    }
+    
+    // Find the first entry that provides any of the same binaries (anywhere in PATH)
+    let mut target_idx = None;
+    for (idx, bin_map) in state_mut.bin_dir_map.iter().enumerate() {
+        if idx == selected_idx {
+            continue; // Skip the selected entry itself
+        }
+        for binary in &selected_binaries {
+            if bin_map.contains_key(binary) {
+                target_idx = Some(idx);
+                break;
+            }
+        }
+        if target_idx.is_some() {
+            break;
+        }
+    }
+    
+    if let Some(target_idx) = target_idx {
+        // Calculate the insertion index, accounting for the removal
+        let insert_idx = if selected_idx < target_idx {
+            target_idx - 1
+        } else {
+            target_idx
+        };
+        
+        // Move the selected entry to just before the target_idx
+        // We need to reorder orig_paths, paths, and bin_dir_map
+        
+        // Move orig_paths
+        let selected_orig = state_mut.orig_paths.remove(selected_idx);
+        state_mut.orig_paths.insert(insert_idx, selected_orig);
+        
+        // Move paths
+        let selected_path = state_mut.paths.remove(selected_idx);
+        state_mut.paths.insert(insert_idx, selected_path);
+        
+        // Move bin_dir_map
+        let selected_bin_map = state_mut.bin_dir_map.remove(selected_idx);
+        state_mut.bin_dir_map.insert(insert_idx, selected_bin_map);
+        
+        // Update the resolved paths and binary mappings
+        update_resolved_paths_and_mappings(&mut state_mut);
+        
+        // Persist the reordered PATH to the registry
+        let new_path = state_mut.orig_paths.join(";");
+        if path_tree::path_utils::set_path_string_for_scope(state_mut.scope, &new_path) {
+            // Successfully updated PATH
+        } else {
+            // Failed to update PATH - could show error message
+        }
+    }
+}
+
+fn update_resolved_paths_and_mappings(state: &mut AppState) {
+    // Rebuild the paths, bin_dir_map, and other mappings based on current orig_paths
+    // This is similar to build_tree_data_with_scope but operates on existing state
+    
+    let scope = state.scope; // Assume we store the scope in AppState
+    
+    let mut expanded_paths: Vec<Option<PathBuf>> = Vec::new();
+    let mut dir_bins: Vec<Vec<OsString>> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut all_dirs: Vec<Vec<PathBuf>> = Vec::new();
+    let mut bin_dir_map_list: Vec<HashMap<String, PathBuf>> = Vec::new();
+    
+    for (idx, orig) in state.orig_paths.iter().enumerate() {
+        let info = expand_env_vars_with_scope(orig, scope);
+        let expanded = info.expanded;
+        // Split expansion that may contain multiple ';'-separated paths
+        let mut subpaths: Vec<PathBuf> = if expanded.is_empty() {
+            Vec::new()
+        } else {
+            std::env::split_paths(&OsString::from(expanded)).collect()
+        };
+        // Keep only existing directories, preserve order
+        let valid_dirs: Vec<PathBuf> = subpaths
+            .drain(..)
+            .filter(|p| p.exists() && p.is_dir())
+            .collect();
+
+        // Treat as resolved if any valid subdir exists; keep the first one for selection-based actions
+        let resolved_first = valid_dirs.get(0).cloned();
+
+        // Aggregate binaries across all valid subdirs for this entry; de-duplicate by name
+        let mut bins_agg: Vec<OsString> = Vec::new();
+        let mut seen_names = std::collections::HashSet::<String>::new();
+        let mut bin_dir_map: HashMap<String, PathBuf> = HashMap::new();
+        for dir_pb in &valid_dirs {
+            let b = collect_binaries_in_dir(dir_pb);
+            for bin in b {
+                let name = bin.to_string_lossy().to_string();
+                if seen_names.insert(name.clone()) {
+                    bins_agg.push(OsString::from(name.clone()));
+                    bin_dir_map.insert(name.clone(), dir_pb.clone());
+                    // owner index is this entry's index
+                    seen.entry(name).or_insert(idx);
+                }
+            }
+        }
+
+        expanded_paths.push(resolved_first);
+        dir_bins.push(bins_agg);
+        all_dirs.push(valid_dirs);
+        bin_dir_map_list.push(bin_dir_map);
+    }
+
+    let mut duplicates = HashMap::new();
+    for bins in &dir_bins {
+        for b in bins {
+            let key = b.to_string_lossy().to_string();
+            *duplicates.entry(key).or_insert(0) += 1;
+        }
+    }
+    
+    // Update the state
+    state.paths = expanded_paths;
+    state.bin_dir_map = bin_dir_map_list;
+    state.seen = seen;
+    state.all_dirs = all_dirs;
+    state.duplicates = duplicates;
+}
+
 fn main() -> AnyResult<()> {
     // Set DPI awareness for proper scaling on high-DPI displays
     winsafe::SetProcessDPIAware()?;
@@ -432,7 +574,7 @@ fn main() -> AnyResult<()> {
     // Create main window
     let wnd_opts = gui::WindowMainOpts {
         title: "Path Tree".into(),
-        size: gui::dpi(970, 600),
+        size: gui::dpi(1030, 600),
         ..Default::default()
     };
     let wnd = gui::WindowMain::new(wnd_opts);
@@ -530,6 +672,13 @@ fn main() -> AnyResult<()> {
         height: gui::dpi_y(20),
         ..Default::default()
     });
+    let btn_prioritise = gui::Button::new(&wnd, gui::ButtonOpts {
+        text: "Prioritise".into(),
+        position: gui::dpi(960, 6),
+        width: gui::dpi_x(60),
+        height: gui::dpi_y(20),
+        ..Default::default()
+    });
     let tv_opts = gui::TreeViewOpts {
     position: gui::dpi(0, 32),
     size: gui::dpi(400, 548),
@@ -540,7 +689,7 @@ fn main() -> AnyResult<()> {
     let edit_opts = gui::EditOpts {
         text: String::new(),
     position: gui::dpi(400, 32),
-    width: gui::dpi_x(570),
+    width: gui::dpi_x(620),
     height: gui::dpi_y(548),
         control_style: co::ES::MULTILINE | co::ES::WANTRETURN | co::ES::AUTOVSCROLL,
         ..Default::default()
@@ -774,9 +923,11 @@ fn main() -> AnyResult<()> {
             let tv_rclick = tv.clone();
             let state_rclick = state.clone();
             let status_rclick = status_bar.clone();
+            let wnd_rclick = wnd.clone();
             tv.on().nm_r_click(move || -> winsafe::AnyResult<i32> {
                 if let Some(item) = tv_rclick.items().iter_selected().next() {
                     if let Some(parent) = item.parent() {
+                        // This is a binary under a PATH entry - just open in Explorer
                         let dir_label = parent.text().unwrap_or_else(|_| String::new());
                         let parent_clean = strip_root_label(&dir_label);
                         let file_name = item.text().unwrap_or_default();
@@ -806,13 +957,69 @@ fn main() -> AnyResult<()> {
                             let _ = status_rclick.set_text("No matching PATH entry for selection");
                         }
                     } else {
+                        // This is a root PATH entry - show context menu
                         let dir_label = item.text().unwrap_or_else(|_| String::new());
                         let root_clean = strip_root_label(&dir_label);
-                        if Path::new(&root_clean).exists() {
-                            let _ = Command::new("explorer").arg(&root_clean).spawn();
-                            let _ = status_rclick.set_text(&format!("Opened folder: {}", root_clean));
-                        } else {
-                            let _ = status_rclick.set_text(&format!("Path does not exist: {}", root_clean));
+                        
+                        // Create context menu using Windows API
+                        let hmenu = unsafe { CreatePopupMenu()? };
+                        
+                        // Add menu items
+                        let explorer_text = "Open in Explorer\tEnter";
+                        let explorer_pcwstr = PCWSTR::from_raw(explorer_text.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>().as_ptr());
+                        unsafe { AppendMenuW(hmenu, MF_STRING, 1, explorer_pcwstr)?; }
+                        
+                        let prioritise_text = "Prioritise binaries";
+                        let prioritise_pcwstr = PCWSTR::from_raw(prioritise_text.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>().as_ptr());
+                        unsafe { AppendMenuW(hmenu, MF_STRING, 2, prioritise_pcwstr)?; }
+                        
+                        // Get cursor position
+                        let cursor_pos = unsafe {
+                            let mut pt = POINT::default();
+                            GetCursorPos(&mut pt)?;
+                            pt
+                        };
+                        
+                        // Show the context menu
+                        let cmd = unsafe {
+                            TrackPopupMenuEx(
+                                hmenu,
+                                (TPM_RETURNCMD | TPM_RIGHTBUTTON).0 as u32,
+                                cursor_pos.x,
+                                cursor_pos.y,
+                                windows::Win32::Foundation::HWND(wnd_rclick.hwnd().ptr()),
+                                None,
+                            ).0 as u32
+                        };
+                        
+                        match cmd {
+                            1 => {
+                                // Open in Explorer
+                                if Path::new(&root_clean).exists() {
+                                    let _ = Command::new("explorer").arg(&root_clean).spawn();
+                                    let _ = status_rclick.set_text(&format!("Opened folder: {}", root_clean));
+                                } else {
+                                    let _ = status_rclick.set_text(&format!("Path does not exist: {}", root_clean));
+                                }
+                            }
+                            2 => {
+                                // Prioritise binaries
+                                let selected_idx = {
+                                    let state_borrow = state_rclick.borrow();
+                                    state_borrow.orig_paths.iter().position(|orig| orig == &root_clean)
+                                };
+                                if let Some(selected_idx) = selected_idx {
+                                    prioritise_entry(&state_rclick, selected_idx);
+                                    // Refresh the tree
+                                    populate_tree_from_state(&tv_rclick, &*state_rclick.borrow())?;
+                                    set_window_title_with_stats(&wnd_rclick, &*state_rclick.borrow())?;
+                                    set_status_bar(&status_rclick, &*state_rclick.borrow())?;
+                                    let _ = status_rclick.set_text(&format!("Prioritised: {}", root_clean));
+                                } else {
+                                    let _ = status_rclick.set_text("Selected entry not found in PATH");
+                                }
+                            }
+                            _ => {} // Menu cancelled
                         }
                     }
                 }
@@ -1178,6 +1385,57 @@ fn main() -> AnyResult<()> {
             Ok(())
         });
 
+        // Prioritise button
+        let state_pri = state.clone();
+        let tv_pri = tv.clone();
+        let status_pri = status.clone();
+        let wnd_pri = wnd.clone();
+        btn_prioritise.on().bn_clicked(move || -> AnyResult<()> {
+            // Get the selected item
+            if let Some(item) = tv_pri.items().iter_selected().next() {
+                if let Some(parent) = item.parent() {
+                    // This is a binary under a PATH entry
+                    let dir_label = parent.text().unwrap_or_else(|_| String::new());
+                    let parent_clean = strip_root_label(&dir_label);
+                    let selected_idx = {
+                        let state_borrow = state_pri.borrow();
+                        state_borrow.orig_paths.iter().position(|orig| orig == &parent_clean)
+                    };
+                    if let Some(selected_idx) = selected_idx {
+                        prioritise_entry(&state_pri, selected_idx);
+                        // Refresh the tree
+                        populate_tree_from_state(&tv_pri, &*state_pri.borrow())?;
+                        set_window_title_with_stats(&wnd_pri, &*state_pri.borrow())?;
+                        set_status_bar(&status_pri, &*state_pri.borrow())?;
+                        let _ = status_pri.set_text(&format!("Prioritised: {}", parent_clean));
+                    } else {
+                        let _ = status_pri.set_text("Selected entry not found in PATH");
+                    }
+                } else {
+                    // This is a root PATH entry
+                    let dir_label = item.text().unwrap_or_else(|_| String::new());
+                    let root_clean = strip_root_label(&dir_label);
+                    let selected_idx = {
+                        let state_borrow = state_pri.borrow();
+                        state_borrow.orig_paths.iter().position(|orig| orig == &root_clean)
+                    };
+                    if let Some(selected_idx) = selected_idx {
+                        prioritise_entry(&state_pri, selected_idx);
+                        // Refresh the tree
+                        populate_tree_from_state(&tv_pri, &*state_pri.borrow())?;
+                        set_window_title_with_stats(&wnd_pri, &*state_pri.borrow())?;
+                        set_status_bar(&status_pri, &*state_pri.borrow())?;
+                        let _ = status_pri.set_text(&format!("Prioritised: {}", root_clean));
+                    } else {
+                        let _ = status_pri.set_text("Selected entry not found in PATH");
+                    }
+                }
+            } else {
+                let _ = status_pri.set_text("No item selected for prioritisation");
+            }
+            Ok(())
+        });
+
         // Export PATH button
         let state_exp = state.clone();
         let status_exp = status.clone();
@@ -1390,3 +1648,4 @@ fn main() -> AnyResult<()> {
     // Run main loop (this will create the window and controls as well)
     wnd.run_main(None).map(|_| ())
 }
+

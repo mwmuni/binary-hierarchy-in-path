@@ -7,6 +7,7 @@ edition = "2021"
 winsafe = { version = "0.0.25", features = ["gui", "user", "kernel"] }
 clap = { version = "4.5", features = ["derive"] }
 chrono = "0.4"
+owo-colors = "4.0"
 windows = { version = "0.58", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Com"] }
 
 [target.'cfg(windows)'.dependencies]
