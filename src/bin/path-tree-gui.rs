@@ -68,6 +68,7 @@ fn build_tree_data_with_scope(scope: RegistryScope) -> (
     HashMap<String, usize>,               // first-seen map for shadowing across entries
     Vec<Vec<PathBuf>>,                    // all resolved subpaths per entry
     Vec<HashMap<String, PathBuf>>,        // per-entry: bin name -> directory path where found
+    HashMap<String, usize>,               // count of entries having each binary
 ) {
     // Use PATH from the selected scope instead of process PATH, so we show only user or only system when requested.
     let path_str = get_path_string_for_scope(scope).unwrap_or_default();
@@ -127,7 +128,15 @@ fn build_tree_data_with_scope(scope: RegistryScope) -> (
         bin_dir_map_list.push(bin_dir_map);
     }
 
-    (expanded_paths, original_paths, dir_bins, seen, all_dirs, bin_dir_map_list)
+    let mut duplicates = HashMap::new();
+    for bins in &dir_bins {
+        for b in bins {
+            let key = b.to_string_lossy().to_string();
+            *duplicates.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    (expanded_paths, original_paths, dir_bins, seen, all_dirs, bin_dir_map_list, duplicates)
 }
 
 #[derive(Clone)]
@@ -140,17 +149,19 @@ struct AppState {
     filter: String,                    // current filter text
     all_dirs: Vec<Vec<PathBuf>>,       // all resolved subpaths per entry
     bin_dir_map: Vec<HashMap<String, PathBuf>>, // per-entry bin -> directory path
+    duplicates: HashMap<String, usize>, // count of entries having each binary
 }
 
 impl AppState {
     fn rebuild(&mut self) {
-    let (paths, orig_paths, dir_bins, seen, all_dirs, bin_dir_map) = build_tree_data_with_scope(self.scope);
+    let (paths, orig_paths, dir_bins, seen, all_dirs, bin_dir_map, duplicates) = build_tree_data_with_scope(self.scope);
     self.paths = paths;
     self.orig_paths = orig_paths;
     self.dir_bins = dir_bins;
     self.seen = seen;
     self.all_dirs = all_dirs;
     self.bin_dir_map = bin_dir_map;
+    self.duplicates = duplicates;
     }
 }
 
@@ -322,21 +333,34 @@ fn populate_tree_from_state(tv: &gui::TreeView<String>, state: &AppState) -> Any
     for (i, _p) in state.paths.iter().enumerate() {
         let base_root = state.orig_paths.get(i).cloned().unwrap_or_default();
     let unresolved = state.paths.get(i).and_then(|o| o.as_ref()).is_none();
-        let mut root_has_overrides = false;
+        let mut has_first = false;
+        let mut has_duplicates = false;
+        let mut has_overridden = false;
         if let Some(bins) = state.dir_bins.get(i) {
             for b in bins {
                 let b_str = b.to_string_lossy().to_string();
                 if let Some(first_idx) = state.seen.get(&b_str) {
-                    if *first_idx != i { root_has_overrides = true; break; }
+                    if *first_idx == i { has_first = true; }
+                    else { 
+                        has_duplicates = true; 
+                        has_overridden = true;
+                    }
+                }
+                if let Some(count) = state.duplicates.get(&b_str) {
+                    if *count > 1 { has_duplicates = true; }
                 }
             }
         }
     // Color prefix semantics:
-    // - � red: non-existent/unresolved root dir
-    // - � green: existing root dir
-    let color_prefix = if unresolved { "🔴 " } else { "🟢 " };
+    // - 🔴 red: non-existent/unresolved root dir
+    // - 🟡 yellow: has overridden binaries
+    // - 🟢 green: existing root dir
+    let color_prefix = if unresolved { "🔴 " } else if has_overridden { "🟡 " } else { "🟢 " };
     let mut root_label = format!("{}{}", color_prefix, base_root);
-    if root_has_overrides { root_label.push_str(" ★"); }
+    if has_duplicates {
+        if has_first { root_label.push_str(" ★"); }
+        else { root_label.push_str(" ♦"); }
+    }
         let mut bins = state.dir_bins.get(i).cloned().unwrap_or_default();
         bins.sort_by_key(|s| s.to_string_lossy().to_lowercase());
     let mut filtered_bins: Vec<OsString> = if filt.is_empty() {
@@ -378,7 +402,7 @@ fn main() -> AnyResult<()> {
 
     // initial scope: User only (requested default)
     let scope_state = RegistryScope::UserOnly;
-    let (paths, orig_paths, dir_bins, seen, all_dirs_init, bin_dir_map_init) = build_tree_data_with_scope(scope_state);
+    let (paths, orig_paths, dir_bins, seen, all_dirs_init, bin_dir_map_init, duplicates_init) = build_tree_data_with_scope(scope_state);
 
     // Create main window
     let wnd_opts = gui::WindowMainOpts {
@@ -496,7 +520,7 @@ fn main() -> AnyResult<()> {
     let details = details.clone();
     let status_bar = status.clone();
     let wnd_for_title = wnd.clone();
-    let mut initial_state = AppState { scope: scope_state, paths, orig_paths, dir_bins, seen, filter: String::new(), all_dirs: all_dirs_init, bin_dir_map: bin_dir_map_init };
+    let mut initial_state = AppState { scope: scope_state, paths, orig_paths, dir_bins, seen, filter: String::new(), all_dirs: all_dirs_init, bin_dir_map: bin_dir_map_init, duplicates: duplicates_init };
     if let Some((saved_scope, saved_filter)) = load_settings() {
         initial_state.scope = saved_scope;
         initial_state.filter = saved_filter;
@@ -685,34 +709,8 @@ fn main() -> AnyResult<()> {
                                     let _ = status_dbl.set_text("Could not locate shadowing item in the tree");
                                 }
                             }
-                        } else {
-                            // default behavior: open in Explorer
-                            if let Some(idx) = state_for_dbl.borrow().orig_paths.iter().position(|orig| orig == &parent_clean) {
-                                // Prefer actual directory for this binary (if known)
-                                let dir_pb_opt = state_for_dbl
-                                    .borrow()
-                                    .bin_dir_map
-                                    .get(idx)
-                                    .and_then(|m| m.get(file_clean.as_str()).cloned())
-                                    .or_else(|| state_for_dbl.borrow().paths.get(idx).and_then(|opt| opt.as_ref().cloned()));
-                                if let Some(dir_pb) = dir_pb_opt {
-                                    let full = dir_pb.join(&file_clean);
-                                    if full.exists() {
-                                        let _ = Command::new("explorer").arg(format!("/select,{}", full.display())).spawn();
-                                        let _ = status_dbl.set_text(&format!("Opened: {}", full.display()));
-                                    } else if dir_pb.exists() {
-                                        let _ = Command::new("explorer").arg(&dir_pb).spawn();
-                                        let _ = status_dbl.set_text(&format!("Opened folder: {}", dir_pb.display()));
-                                    } else {
-                                        let _ = status_dbl.set_text(&format!("Path does not exist: {}", dir_pb.display()));
-                                    }
-                                } else {
-                                    let _ = status_dbl.set_text("Path is unresolved; nothing to open");
-                                }
-                            } else {
-                                let _ = status_dbl.set_text("No matching PATH entry for selection");
-                            }
                         }
+                        // Removed: else open in Explorer on double-click
                     } else {
                         let dir_label = item.text().unwrap_or_else(|_| String::new());
                         let root_clean = strip_root_label(&dir_label);
@@ -721,6 +719,54 @@ fn main() -> AnyResult<()> {
                             let _ = status_dbl.set_text(&format!("Opened folder: {}", root_clean));
                         } else {
                             let _ = status_dbl.set_text(&format!("Path does not exist: {}", root_clean));
+                        }
+                    }
+                }
+                Ok(0)
+            });
+
+            let tv_rclick = tv.clone();
+            let state_rclick = state.clone();
+            let status_rclick = status_bar.clone();
+            tv.on().nm_r_click(move || -> winsafe::AnyResult<i32> {
+                if let Some(item) = tv_rclick.items().iter_selected().next() {
+                    if let Some(parent) = item.parent() {
+                        let dir_label = parent.text().unwrap_or_else(|_| String::new());
+                        let parent_clean = strip_root_label(&dir_label);
+                        let file_name = item.text().unwrap_or_default();
+                        let file_clean = strip_child_label(&file_name);
+                        if let Some(idx) = state_rclick.borrow().orig_paths.iter().position(|orig| orig == &parent_clean) {
+                            let dir_pb_opt = state_rclick
+                                .borrow()
+                                .bin_dir_map
+                                .get(idx)
+                                .and_then(|m| m.get(file_clean.as_str()).cloned())
+                                .or_else(|| state_rclick.borrow().paths.get(idx).and_then(|opt| opt.as_ref().cloned()));
+                            if let Some(dir_pb) = dir_pb_opt {
+                                let full = dir_pb.join(&file_clean);
+                                if full.exists() {
+                                    let _ = Command::new("explorer").arg(format!("/select,{}", full.display())).spawn();
+                                    let _ = status_rclick.set_text(&format!("Opened: {}", full.display()));
+                                } else if dir_pb.exists() {
+                                    let _ = Command::new("explorer").arg(&dir_pb).spawn();
+                                    let _ = status_rclick.set_text(&format!("Opened folder: {}", dir_pb.display()));
+                                } else {
+                                    let _ = status_rclick.set_text(&format!("Path does not exist: {}", dir_pb.display()));
+                                }
+                            } else {
+                                let _ = status_rclick.set_text("Path is unresolved; nothing to open");
+                            }
+                        } else {
+                            let _ = status_rclick.set_text("No matching PATH entry for selection");
+                        }
+                    } else {
+                        let dir_label = item.text().unwrap_or_else(|_| String::new());
+                        let root_clean = strip_root_label(&dir_label);
+                        if Path::new(&root_clean).exists() {
+                            let _ = Command::new("explorer").arg(&root_clean).spawn();
+                            let _ = status_rclick.set_text(&format!("Opened folder: {}", root_clean));
+                        } else {
+                            let _ = status_rclick.set_text(&format!("Path does not exist: {}", root_clean));
                         }
                     }
                 }
