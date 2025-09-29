@@ -8,8 +8,10 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use winsafe::prelude::*;
 use winsafe::{gui, AnyResult, co};
-use windows::Win32::UI::WindowsAndMessaging::{CreatePopupMenu, AppendMenuW, TrackPopupMenuEx, GetCursorPos, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON};
-use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::WindowsAndMessaging::{CreatePopupMenu, AppendMenuW, TrackPopupMenuEx, SendMessageW, DestroyMenu, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON};
+use windows::Win32::Foundation::{POINT as WinPoint, LPARAM, WPARAM};
+use windows::Win32::UI::Controls::{TVM_HITTEST, TVHITTESTINFO, TVHITTESTINFO_FLAGS, TVHT_ONITEMICON, TVHT_ONITEMLABEL, TVHT_ONITEMSTATEICON};
+use std::ffi::c_void;
 use windows::core::PCWSTR;
 use winsafe::msg;
 use path_tree::path_utils::{expand_env_vars_with_scope, RegistryScope, get_path_string_for_scope};
@@ -28,13 +30,31 @@ fn strip_child_label(s: &str) -> String {
 
 // Helper: strip root item decorations (emoji + trailing markers)
 fn strip_root_label(mut s: &str) -> String {
-    if let Some(t) = s.strip_suffix(" ⚠") { s = t; }
-    if let Some(t) = s.strip_suffix(" ★") { s = t; }
-    if let Some(t) = s.strip_suffix(" ♦") { s = t; }
-    if let Some(t) = s.strip_prefix("🟢 ") { return t.to_string(); }
-    if let Some(t) = s.strip_prefix("🟡 ") { return t.to_string(); }
-    if let Some(t) = s.strip_prefix("🔴 ") { return t.to_string(); }
+    for suffix in [" ⚠", " ★", " ♦"] {
+        if let Some(t) = s.strip_suffix(suffix) { s = t; }
+    }
+
+    if let Some(t) = s.strip_prefix("🟢 ") {
+        s = t;
+    } else if let Some(t) = s.strip_prefix("🟡 ") {
+        s = t;
+    } else if let Some(t) = s.strip_prefix("� ") {
+        s = t;
+    }
+
+    if let Some(t) = s.strip_prefix("[marked] ") { s = t; }
     s.to_string()
+}
+
+fn extract_index_from_data(data: &Rc<RefCell<String>>) -> Option<usize> {
+    let guard = data.borrow();
+    guard
+        .split_once(':')
+        .and_then(|(idx, _)| idx.parse::<usize>().ok())
+}
+
+fn tree_item_index(item: &gui::TreeViewItem<String>) -> Option<usize> {
+    item.data().ok().and_then(|data| extract_index_from_data(&data))
 }
 
 fn is_executable_on_windows(path: &Path) -> bool {
@@ -167,6 +187,21 @@ fn find_redundant_entries(
     redundant
 }
 
+/// Identify which PATH entries are unresolved (do not resolve to existing directories).
+/// Returns a vector of indices of unresolved entries.
+fn find_unresolved_entries(
+    resolved_paths: &[Option<PathBuf>],
+) -> Vec<usize> {
+    let mut unresolved = Vec::new();
+    
+    for (i, resolved_path) in resolved_paths.iter().enumerate() {
+        if resolved_path.is_none() {
+            unresolved.push(i);
+        }
+    }
+    unresolved
+}
+
 #[derive(Clone)]
 struct AppState {
     scope: RegistryScope,
@@ -178,6 +213,7 @@ struct AppState {
     all_dirs: Vec<Vec<PathBuf>>,       // all resolved subpaths per entry
     bin_dir_map: Vec<HashMap<String, PathBuf>>, // per-entry bin -> directory path
     duplicates: HashMap<String, usize>, // count of entries having each binary
+    marked_for_deletion: HashSet<usize>, // indices of PATH entries marked for deletion
 }
 
 impl AppState {
@@ -190,6 +226,7 @@ impl AppState {
     self.all_dirs = all_dirs;
     self.bin_dir_map = bin_dir_map;
     self.duplicates = duplicates;
+    self.marked_for_deletion.clear();
     }
 }
 
@@ -307,6 +344,7 @@ fn expand_or_collapse_all_roots(tv: &gui::TreeView<String>, expand: bool) {
 
 // Helper: select and reveal a specific child binary under a given root (by original PATH entry string)
 // Returns true if selection succeeded
+#[allow(dead_code)]
 fn select_child_under_root(
     tv: &gui::TreeView<String>,
     root_clean_label: &str,
@@ -360,7 +398,11 @@ fn populate_tree_from_state(tv: &gui::TreeView<String>, state: &AppState) -> Any
     let filt = state.filter.trim().to_ascii_lowercase();
     for (i, _p) in state.paths.iter().enumerate() {
         let base_root = state.orig_paths.get(i).cloned().unwrap_or_default();
-    let unresolved = state.paths.get(i).and_then(|o| o.as_ref()).is_none();
+        let unresolved = state
+            .paths
+            .get(i)
+            .and_then(|opt| opt.as_ref())
+            .is_none();
         let mut has_first = false;
         let mut has_duplicates = false;
         let mut has_overridden = false;
@@ -388,7 +430,8 @@ fn populate_tree_from_state(tv: &gui::TreeView<String>, state: &AppState) -> Any
         (false, true) => "🔴 ",
         (false, false) => "🟢 ",
     };
-    let mut root_label = format!("{}{}", color_prefix, base_root);
+    let marker = if state.marked_for_deletion.contains(&i) { "[marked] " } else { "" };
+    let mut root_label = format!("{}{}{}", color_prefix, marker, base_root);
     if has_duplicates {
         if has_first { root_label.push_str(" ★"); }
         else { root_label.push_str(" ♦"); }
@@ -408,16 +451,16 @@ fn populate_tree_from_state(tv: &gui::TreeView<String>, state: &AppState) -> Any
             continue; // hide directory with no matches
         }
 
-        let root = tv.items().add_root(&root_label, None, base_root.clone())?;
+        let root = tv.items().add_root(&root_label, None, format!("{}:{}", i, base_root))?;
         for b in filtered_bins.drain(..) {
             let b_str = b.to_string_lossy().to_string();
-            let is_overridden = state.seen.get(&b_str).map(|first_idx| *first_idx != i).unwrap_or(false);
+            let _is_overridden = state.seen.get(&b_str).map(|first_idx| *first_idx != i).unwrap_or(false);
             // Color prefix semantics for binaries:
             // - 🟡 yellow: overridden (shadowed)
             // - 🟢 green: effective
-            let emoji = if is_overridden { "🟡 " } else { "🟢 " };
+            let emoji = if _is_overridden { "🟡 " } else { "🟢 " };
             // Append inline goto chevron for overridden binaries
-            let label = if is_overridden {
+            let label = if _is_overridden {
                 format!("{}{} [overridden] ⤴", emoji, b_str)
             } else {
                 format!("{}{}", emoji, b_str)
@@ -563,6 +606,11 @@ fn update_resolved_paths_and_mappings(state: &mut AppState) {
     state.duplicates = duplicates;
 }
 
+#[link(name = "user32")]
+extern "system" {
+    fn EnableWindow(hWnd: isize, bEnable: i32) -> i32;
+}
+
 fn main() -> AnyResult<()> {
     // Set DPI awareness for proper scaling on high-DPI displays
     winsafe::SetProcessDPIAware()?;
@@ -574,7 +622,7 @@ fn main() -> AnyResult<()> {
     // Create main window
     let wnd_opts = gui::WindowMainOpts {
         title: "Path Tree".into(),
-        size: gui::dpi(1030, 600),
+        size: gui::dpi(1300, 600),
         ..Default::default()
     };
     let wnd = gui::WindowMain::new(wnd_opts);
@@ -617,79 +665,93 @@ fn main() -> AnyResult<()> {
     });
     let btn_collapse_all = gui::Button::new(&wnd, gui::ButtonOpts {
         text: "Collapse all".into(),
-        position: gui::dpi(372, 6),
+        position: gui::dpi(376, 6),
         width: gui::dpi_x(96),
         height: gui::dpi_y(20),
         ..Default::default()
     });
     // Filter and quick action buttons
+    let btn_delete_marked = gui::Button::new(&wnd, gui::ButtonOpts {
+        text: "Delete Marked".into(),
+        position: gui::dpi(480, 6),
+        width: gui::dpi_x(100),
+        height: gui::dpi_y(20),
+        ..Default::default()
+    });
     let edt_filter = gui::Edit::new(&wnd, gui::EditOpts {
         text: String::new(),
-        position: gui::dpi(472, 6),
+        position: gui::dpi(588, 6),
         width: gui::dpi_x(200),
         height: gui::dpi_y(20),
         ..Default::default()
     });
     let btn_open_folder = gui::Button::new(&wnd, gui::ButtonOpts {
         text: "Open".into(),
-        position: gui::dpi(676, 6),
+        position: gui::dpi(796, 6),
         width: gui::dpi_x(40),
         height: gui::dpi_y(20),
         ..Default::default()
     });
     let btn_copy_path = gui::Button::new(&wnd, gui::ButtonOpts {
         text: "Copy".into(),
-        position: gui::dpi(720, 6),
+        position: gui::dpi(844, 6),
         width: gui::dpi_x(40),
         height: gui::dpi_y(20),
         ..Default::default()
     });
     let btn_ps_here = gui::Button::new(&wnd, gui::ButtonOpts {
         text: "PS".into(),
-        position: gui::dpi(764, 6),
+        position: gui::dpi(892, 6),
         width: gui::dpi_x(32),
         height: gui::dpi_y(20),
         ..Default::default()
     });
     let btn_remove_dup = gui::Button::new(&wnd, gui::ButtonOpts {
         text: "Rm Dup".into(),
-        position: gui::dpi(798, 6),
+        position: gui::dpi(932, 6),
         width: gui::dpi_x(50),
         height: gui::dpi_y(20),
         ..Default::default()
     });
     let btn_export_path = gui::Button::new(&wnd, gui::ButtonOpts {
         text: "Export".into(),
-        position: gui::dpi(852, 6),
+        position: gui::dpi(990, 6),
         width: gui::dpi_x(50),
         height: gui::dpi_y(20),
         ..Default::default()
     });
     let btn_import_path = gui::Button::new(&wnd, gui::ButtonOpts {
         text: "Import".into(),
-        position: gui::dpi(906, 6),
+        position: gui::dpi(1048, 6),
         width: gui::dpi_x(50),
         height: gui::dpi_y(20),
         ..Default::default()
     });
     let btn_prioritise = gui::Button::new(&wnd, gui::ButtonOpts {
         text: "Prioritise".into(),
-        position: gui::dpi(960, 6),
+        position: gui::dpi(1106, 6),
         width: gui::dpi_x(60),
+        height: gui::dpi_y(20),
+        ..Default::default()
+    });
+    let btn_remove_unresolved = gui::Button::new(&wnd, gui::ButtonOpts {
+        text: "Rm Unresolved".into(),
+        position: gui::dpi(1174, 6),
+        width: gui::dpi_x(100),
         height: gui::dpi_y(20),
         ..Default::default()
     });
     let tv_opts = gui::TreeViewOpts {
     position: gui::dpi(0, 32),
-    size: gui::dpi(400, 548),
+    size: gui::dpi(500, 548),
         ..Default::default()
     };
     let tv: gui::TreeView<String> = gui::TreeView::new(&wnd, tv_opts);
 
     let edit_opts = gui::EditOpts {
         text: String::new(),
-    position: gui::dpi(400, 32),
-    width: gui::dpi_x(620),
+    position: gui::dpi(500, 32),
+    width: gui::dpi_x(800),
     height: gui::dpi_y(548),
         control_style: co::ES::MULTILINE | co::ES::WANTRETURN | co::ES::AUTOVSCROLL,
         ..Default::default()
@@ -702,7 +764,7 @@ fn main() -> AnyResult<()> {
     let status_opts = gui::EditOpts {
         text: String::new(),
         position: gui::dpi(0, 580),
-        width: gui::dpi_x(800),
+        width: gui::dpi_x(1300),
         height: gui::dpi_y(20),
         control_style: co::ES::READONLY | co::ES::AUTOHSCROLL,
         ..Default::default()
@@ -715,7 +777,7 @@ fn main() -> AnyResult<()> {
     let details = details.clone();
     let status_bar = status.clone();
     let wnd_for_title = wnd.clone();
-    let mut initial_state = AppState { scope: scope_state, paths, orig_paths, dir_bins, seen, filter: String::new(), all_dirs: all_dirs_init, bin_dir_map: bin_dir_map_init, duplicates: duplicates_init };
+    let mut initial_state = AppState { scope: scope_state, paths, orig_paths, dir_bins, seen, filter: String::new(), all_dirs: all_dirs_init, bin_dir_map: bin_dir_map_init, duplicates: duplicates_init, marked_for_deletion: HashSet::new() };
     if let Some((saved_scope, saved_filter)) = load_settings() {
         initial_state.scope = saved_scope;
         initial_state.filter = saved_filter;
@@ -735,10 +797,9 @@ fn main() -> AnyResult<()> {
                     // determine the directory index using the selected item's parent when possible
                     let mut idx_opt: Option<usize> = None;
                     if let Some(parent_item) = item.parent() {
-                        let parent_text = parent_item.text().unwrap_or_default();
-                        let parent_clean = strip_root_label(&parent_text);
-                        // match parent_text against original PATH entries
-                        idx_opt = state_sel.borrow().orig_paths.iter().position(|orig| orig == &parent_clean);
+                        if let Some(idx) = tree_item_index(&parent_item) {
+                            idx_opt = Some(idx);
+                        }
                     }
                     // fallback to first-seen index
                     if idx_opt.is_none() {
@@ -762,7 +823,7 @@ fn main() -> AnyResult<()> {
                         let expanded_dir_str = expanded_list.first().cloned().unwrap_or_default();
                         let original_dir = state_sel.borrow().orig_paths.get(idx).cloned().unwrap_or_default();
                         // status: overridden if this occurrence is not the first seen
-                        let is_overridden = state_sel.borrow().seen.get(selected_clean.as_str()).map(|first_idx| *first_idx != idx).unwrap_or(false);
+                        let _is_overridden = state_sel.borrow().seen.get(selected_clean.as_str()).map(|first_idx| *first_idx != idx).unwrap_or(false);
                         // try to get file metadata for expanded path + filename (only if expanded exists)
                         // Prefer the directory where this binary was actually found (within this entry)
                         let full_path = state_sel
@@ -795,7 +856,7 @@ fn main() -> AnyResult<()> {
                         if info.cycle_detected { meta_lines.push("⚠ Cycle detected during expansion".to_string()); }
                         if info.reached_depth_limit { meta_lines.push("⚠ Reached expansion depth limit".to_string()); }
                         // shadowing status and overriding entry details
-                        if is_overridden {
+                        if false {
                             meta_lines.push("Status: overridden (shadowed)".to_string());
                             if let Some(first_idx) = state_sel.borrow().seen.get(selected_clean.as_str()) {
                                 let ov_orig = state_sel.borrow().orig_paths.get(*first_idx).cloned().unwrap_or_default();
@@ -822,7 +883,7 @@ fn main() -> AnyResult<()> {
                         // try to show original and expanded forms for the root if available
                         let txt_clean = strip_root_label(&txt);
                         let mut details_text = format!("Path: {}", txt_clean);
-                        if let Some(idx) = state_sel.borrow().orig_paths.iter().position(|orig| orig == &txt_clean) {
+                        if let Some(idx) = tree_item_index(&item) {
                             let orig = state_sel.borrow().orig_paths.get(idx).cloned().unwrap_or_default();
                             let expanded_list: Vec<String> = state_sel
                                 .borrow()
@@ -874,37 +935,19 @@ fn main() -> AnyResult<()> {
             tv.on().nm_dbl_clk(move || -> winsafe::AnyResult<i32> {
                 if let Some(item) = tv_dbl.items().iter_selected().next() {
                     if let Some(parent) = item.parent() {
-                        let dir_label = parent.text().unwrap_or_else(|_| String::new());
-                        let parent_clean = strip_root_label(&dir_label);
                         let file_name = item.text().unwrap_or_default();
                         let file_clean = strip_child_label(&file_name);
                         // If this is an overridden item, interpret double-click as "Go to" shadowing
-                        let is_overridden = state_for_dbl.borrow().seen.get(file_clean.as_str()).map(|first_idx| {
-                            if let Some(cur_idx) = state_for_dbl.borrow().orig_paths.iter().position(|orig| orig == &parent_clean) {
-                                *first_idx != cur_idx
-                            } else { false }
-                        }).unwrap_or(false);
+                        let _is_overridden = tree_item_index(&parent)
+                            .and_then(|cur_idx| {
+                                state_for_dbl
+                                    .borrow()
+                                    .seen
+                                    .get(file_clean.as_str())
+                                    .map(|first_idx| *first_idx != cur_idx)
+                            })
+                            .unwrap_or(false);
 
-                        if is_overridden {
-                            let cur_idx = state_for_dbl.borrow().orig_paths.iter().position(|orig| orig == &parent_clean);
-                            let first_idx_opt = state_for_dbl.borrow().seen.get(file_clean.as_str()).copied();
-                            if let (Some(_cur_idx), Some(first_idx)) = (cur_idx, first_idx_opt) {
-                                let root_label = state_for_dbl.borrow().orig_paths[first_idx].clone();
-                                let mut ok = select_child_under_root(&tv_dbl, &root_label, &file_clean);
-                                if !ok {
-                                    // Adjust filter to reveal the item, then repopulate and retry
-                                    state_for_dbl.borrow_mut().filter = file_clean.clone();
-                                    // Note: we don't have direct access to the filter edit here; repopulate using updated state
-                                    populate_tree_from_state(&tv_dbl, &state_for_dbl.borrow())?;
-                                    ok = select_child_under_root(&tv_dbl, &root_label, &file_clean);
-                                }
-                                if ok {
-                                    let _ = status_dbl.set_text(&format!("Jumped to shadowing at: {}", root_label));
-                                } else {
-                                    let _ = status_dbl.set_text("Could not locate shadowing item in the tree");
-                                }
-                            }
-                        }
                         // Removed: else open in Explorer on double-click
                     } else {
                         let dir_label = item.text().unwrap_or_else(|_| String::new());
@@ -924,15 +967,44 @@ fn main() -> AnyResult<()> {
             let state_rclick = state.clone();
             let status_rclick = status_bar.clone();
             let wnd_rclick = wnd.clone();
+            let btn_delete_marked_rclick = btn_delete_marked.clone();
             tv.on().nm_r_click(move || -> winsafe::AnyResult<i32> {
+                let hwnd_tv = tv_rclick.hwnd();
+                let cursor_pos = winsafe::GetCursorPos()?;
+                let client_pos = hwnd_tv.ScreenToClient(cursor_pos)?;
+
+                let mut hit = TVHITTESTINFO {
+                    pt: WinPoint { x: client_pos.x, y: client_pos.y },
+                    flags: TVHITTESTINFO_FLAGS(0),
+                    hItem: Default::default(),
+                };
+                unsafe {
+                    SendMessageW(
+                        windows::Win32::Foundation::HWND(hwnd_tv.ptr()),
+                        TVM_HITTEST,
+                        WPARAM(0),
+                        LPARAM(&mut hit as *mut _ as isize),
+                    );
+                }
+
+                let hit_item = hit.hItem;
+                let on_item = (hit.flags.0 & (TVHT_ONITEMICON.0 | TVHT_ONITEMLABEL.0 | TVHT_ONITEMSTATEICON.0)) != 0;
+
+                if hit_item.0 != 0 && on_item {
+                    let hi = unsafe { winsafe::HTREEITEM::from_ptr(hit_item.0 as *mut c_void) };
+                    unsafe {
+                        let _ = hwnd_tv.SendMessage(msg::tvm::SelectItem { action: co::TVGN::CARET, hitem: &hi });
+                    }
+                } else {
+                    return Ok(0);
+                }
+
                 if let Some(item) = tv_rclick.items().iter_selected().next() {
                     if let Some(parent) = item.parent() {
                         // This is a binary under a PATH entry - just open in Explorer
-                        let dir_label = parent.text().unwrap_or_else(|_| String::new());
-                        let parent_clean = strip_root_label(&dir_label);
                         let file_name = item.text().unwrap_or_default();
                         let file_clean = strip_child_label(&file_name);
-                        if let Some(idx) = state_rclick.borrow().orig_paths.iter().position(|orig| orig == &parent_clean) {
+                        if let Some(idx) = tree_item_index(&parent) {
                             let dir_pb_opt = state_rclick
                                 .borrow()
                                 .bin_dir_map
@@ -973,13 +1045,14 @@ fn main() -> AnyResult<()> {
                         let prioritise_pcwstr = PCWSTR::from_raw(prioritise_text.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>().as_ptr());
                         unsafe { AppendMenuW(hmenu, MF_STRING, 2, prioritise_pcwstr)?; }
                         
-                        // Get cursor position
-                        let cursor_pos = unsafe {
-                            let mut pt = POINT::default();
-                            GetCursorPos(&mut pt)?;
-                            pt
-                        };
+                        // Check if already marked
+                        let selected_idx = tree_item_index(&item);
+                        let is_marked = selected_idx.map(|idx| state_rclick.borrow().marked_for_deletion.contains(&idx)).unwrap_or(false);
+                        let mark_text = if is_marked { "Unmark for deletion" } else { "Mark for deletion" };
+                        let mark_pcwstr = PCWSTR::from_raw(mark_text.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>().as_ptr());
+                        unsafe { AppendMenuW(hmenu, MF_STRING, 3, mark_pcwstr)?; }
                         
+                        // Get cursor position
                         // Show the context menu
                         let cmd = unsafe {
                             TrackPopupMenuEx(
@@ -1004,10 +1077,6 @@ fn main() -> AnyResult<()> {
                             }
                             2 => {
                                 // Prioritise binaries
-                                let selected_idx = {
-                                    let state_borrow = state_rclick.borrow();
-                                    state_borrow.orig_paths.iter().position(|orig| orig == &root_clean)
-                                };
                                 if let Some(selected_idx) = selected_idx {
                                     prioritise_entry(&state_rclick, selected_idx);
                                     // Refresh the tree
@@ -1019,8 +1088,30 @@ fn main() -> AnyResult<()> {
                                     let _ = status_rclick.set_text("Selected entry not found in PATH");
                                 }
                             }
+                            3 => {
+                                // Mark/Unmark for deletion
+                                if let Some(selected_idx) = selected_idx {
+                                    let mut state_mut = state_rclick.borrow_mut();
+                                    if state_mut.marked_for_deletion.contains(&selected_idx) {
+                                        state_mut.marked_for_deletion.remove(&selected_idx);
+                                        let _ = status_rclick.set_text(&format!("Unmarked: {}", root_clean));
+                                    } else {
+                                        state_mut.marked_for_deletion.insert(selected_idx);
+                                        let _ = status_rclick.set_text(&format!("Marked for deletion: {}", root_clean));
+                                    }
+                                    // Refresh the tree
+                                    drop(state_mut);
+                                    unsafe { EnableWindow(btn_delete_marked_rclick.hwnd().ptr() as _, if !state_rclick.borrow().marked_for_deletion.is_empty() {1} else {0}); }
+                                    populate_tree_from_state(&tv_rclick, &*state_rclick.borrow())?;
+                                    set_window_title_with_stats(&wnd_rclick, &*state_rclick.borrow())?;
+                                    set_status_bar(&status_rclick, &*state_rclick.borrow())?;
+                                } else {
+                                    let _ = status_rclick.set_text("Selected entry not found in PATH");
+                                }
+                            }
                             _ => {} // Menu cancelled
                         }
+                        unsafe { let _ = DestroyMenu(hmenu); }
                     }
                 }
                 Ok(0)
@@ -1052,6 +1143,10 @@ fn main() -> AnyResult<()> {
                         } else if text.starts_with("🟢 ") {
                             color = winsafe::COLORREF::from_rgb(0, 128, 0);
                         }
+                        // Override for marked items
+                        if text.contains(" [marked]") {
+                            color = winsafe::COLORREF::from_rgb(128, 0, 128); // Purple
+                        }
                     }
                     p.clrText = color;
                     return Ok(co::CDRF::NEWFONT);
@@ -1067,6 +1162,7 @@ fn main() -> AnyResult<()> {
         let wnd_on_create = wnd.clone();
         let edt_filter_init = edt_filter.clone();
         let status_init = status.clone();
+        let btn_delete_marked_init = btn_delete_marked.clone();
         wnd.on().wm_create(move |_| {
             // initial tree population
             populate_tree_from_state(&tv_init, &state_init.borrow())?;
@@ -1088,6 +1184,8 @@ fn main() -> AnyResult<()> {
             // apply saved filter text
             let ftxt = state_init.borrow().filter.clone();
             if !ftxt.is_empty() { edt_filter_init.set_text(&ftxt)?; }
+            // disable delete button initially
+            unsafe { EnableWindow(btn_delete_marked_init.hwnd().ptr() as _, 0); }
             Ok(0)
         });
 
@@ -1190,11 +1288,10 @@ fn main() -> AnyResult<()> {
         btn_open_folder.on().bn_clicked(move || -> AnyResult<()> {
             if let Some(item) = tv_open.items().iter_selected().next() {
                 if let Some(parent) = item.parent() {
-                    let dir_label = parent.text().unwrap_or_default();
-                    let parent_clean = strip_root_label(&dir_label);
+                    let idx = tree_item_index(&parent);
                     let file_name = item.text().unwrap_or_default();
                     let file_clean = strip_child_label(&file_name);
-                    if let Some(idx) = state_open.borrow().orig_paths.iter().position(|orig| orig == &parent_clean) {
+                    if let Some(idx) = idx {
                         // Prefer the actual directory where this binary resides for this PATH entry
                         let dir_pb_opt = state_open
                             .borrow()
@@ -1241,10 +1338,8 @@ fn main() -> AnyResult<()> {
                 let mut to_copy = item.text().unwrap_or_default();
                 // if child, get full expanded path
                 if let Some(parent) = item.parent() {
-                    let ptxt = parent.text().unwrap_or_default();
-                    let parent_clean = strip_root_label(&ptxt);
                     let file_clean = strip_child_label(&to_copy);
-                    if let Some(idx) = state_copy.borrow().orig_paths.iter().position(|orig| orig == &parent_clean) {
+                    if let Some(idx) = tree_item_index(&parent) {
                         // Prefer bin-specific directory if available
                         let dir_pb_opt = state_copy
                             .borrow()
@@ -1252,14 +1347,16 @@ fn main() -> AnyResult<()> {
                             .get(idx)
                             .and_then(|m| m.get(file_clean.as_str()).cloned())
                             .or_else(|| state_copy.borrow().paths.get(idx).and_then(|opt| opt.as_ref().cloned()));
-                        if let Some(dir_pb) = dir_pb_opt { to_copy = dir_pb.join(&file_clean).display().to_string(); }
+                        if let Some(dir_pb) = dir_pb_opt {
+                            to_copy = dir_pb.join(&file_clean).display().to_string();
+                        }
                     }
                 }
                 // Use PowerShell Set-Clipboard (reliable on Windows)
                 let _ = Command::new("powershell")
                     .args(["-NoProfile", "-Command", &format!("Set-Clipboard -AsPlainText -Value @'\r\n{}\r\n'@", to_copy)])
                     .spawn();
-        let _ = status_copy.set_text(&format!("Copied: {}", to_copy));
+                let _ = status_copy.set_text(&format!("Copied: {}", to_copy));
             }
             Ok(())
         });
@@ -1272,9 +1369,7 @@ fn main() -> AnyResult<()> {
             let mut dir_to_open: Option<String> = None;
             if let Some(item) = tv_ps.items().iter_selected().next() {
                 if let Some(parent) = item.parent() {
-                    let ptxt = parent.text().unwrap_or_default();
-                    let parent_clean = strip_root_label(&ptxt);
-                    if let Some(idx) = state_ps.borrow().orig_paths.iter().position(|orig| orig == &parent_clean) {
+                    if let Some(idx) = tree_item_index(&parent) {
                         // Prefer actual directory where the binary resides when a child is selected
                         if let Some(sel_text) = item.text().ok().map(|s| strip_child_label(&s)) {
                             if let Some(dir_pb) = state_ps.borrow().bin_dir_map.get(idx).and_then(|m| m.get(sel_text.as_str()).cloned()) {
@@ -1288,14 +1383,10 @@ fn main() -> AnyResult<()> {
                             }
                         }
                     }
-                } else {
+                } else if let Some(idx) = tree_item_index(&item) {
                     // root item: try expand to resolved path
-                    let rtxt = item.text().unwrap_or_default();
-                    let root_clean = strip_root_label(&rtxt);
-                    if let Some(idx) = state_ps.borrow().orig_paths.iter().position(|orig| orig == &root_clean) {
-                        if let Some(first) = state_ps.borrow().paths.get(idx).and_then(|opt| opt.as_ref().cloned()) {
-                            if first.exists() { dir_to_open = Some(first.display().to_string()); }
-                        }
+                    if let Some(Some(dir_pb)) = state_ps.borrow().paths.get(idx) {
+                        if dir_pb.exists() { dir_to_open = Some(dir_pb.display().to_string()); }
                     }
                 }
             }
@@ -1391,47 +1482,185 @@ fn main() -> AnyResult<()> {
         let status_pri = status.clone();
         let wnd_pri = wnd.clone();
         btn_prioritise.on().bn_clicked(move || -> AnyResult<()> {
-            // Get the selected item
             if let Some(item) = tv_pri.items().iter_selected().next() {
                 if let Some(parent) = item.parent() {
                     // This is a binary under a PATH entry
-                    let dir_label = parent.text().unwrap_or_else(|_| String::new());
-                    let parent_clean = strip_root_label(&dir_label);
-                    let selected_idx = {
-                        let state_borrow = state_pri.borrow();
-                        state_borrow.orig_paths.iter().position(|orig| orig == &parent_clean)
-                    };
+                    let selected_idx = tree_item_index(&parent);
                     if let Some(selected_idx) = selected_idx {
                         prioritise_entry(&state_pri, selected_idx);
                         // Refresh the tree
                         populate_tree_from_state(&tv_pri, &*state_pri.borrow())?;
                         set_window_title_with_stats(&wnd_pri, &*state_pri.borrow())?;
                         set_status_bar(&status_pri, &*state_pri.borrow())?;
-                        let _ = status_pri.set_text(&format!("Prioritised: {}", parent_clean));
+                        let _ = status_pri.set_text(&format!("Prioritised: {}", parent.text().unwrap_or_default()));
                     } else {
                         let _ = status_pri.set_text("Selected entry not found in PATH");
                     }
                 } else {
                     // This is a root PATH entry
-                    let dir_label = item.text().unwrap_or_else(|_| String::new());
-                    let root_clean = strip_root_label(&dir_label);
-                    let selected_idx = {
-                        let state_borrow = state_pri.borrow();
-                        state_borrow.orig_paths.iter().position(|orig| orig == &root_clean)
-                    };
+                    let selected_idx = tree_item_index(&item);
                     if let Some(selected_idx) = selected_idx {
                         prioritise_entry(&state_pri, selected_idx);
                         // Refresh the tree
                         populate_tree_from_state(&tv_pri, &*state_pri.borrow())?;
                         set_window_title_with_stats(&wnd_pri, &*state_pri.borrow())?;
                         set_status_bar(&status_pri, &*state_pri.borrow())?;
-                        let _ = status_pri.set_text(&format!("Prioritised: {}", root_clean));
+                        let _ = status_pri.set_text(&format!("Prioritised: {}", item.text().unwrap_or_default()));
                     } else {
                         let _ = status_pri.set_text("Selected entry not found in PATH");
                     }
                 }
             } else {
                 let _ = status_pri.set_text("No item selected for prioritisation");
+            }
+            Ok(())
+        });
+
+        // Remove Unresolved button
+        let state_unres = state.clone();
+        let tv_unres = tv.clone();
+        let status_unres = status.clone();
+        let wnd_unres = wnd.clone();
+        btn_remove_unresolved.on().bn_clicked(move || -> AnyResult<()> {
+            let unresolved = find_unresolved_entries(&state_unres.borrow().paths);
+            if unresolved.is_empty() {
+                let _ = status_unres.set_text("No unresolved entries found");
+                return Ok(());
+            }
+
+            // Show confirmation dialog using Windows API
+            let scope_name = match state_unres.borrow().scope {
+                RegistryScope::UserOnly => "User",
+                RegistryScope::SystemOnly => "System", 
+                RegistryScope::ProcessOnly => "Process",
+                _ => "Unknown",
+            };
+            
+            use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MESSAGEBOX_STYLE, MB_ICONWARNING, MB_YESNO};
+            
+            let title = "Confirm PATH Modification";
+            let message = format!(
+                "This will remove {} unresolved PATH entries from the {} scope.\n\
+                Unresolved entries are those that do not resolve to existing directories.\n\n\
+                WARNING: This modifies your system's PATH environment variable.\n\
+                It is recommended to backup your PATH before proceeding.\n\n\
+                Do you want to continue?",
+                unresolved.len(), scope_name
+            );
+            
+            // Convert strings to UTF-16
+            let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+            let message_wide: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+            
+            let result = unsafe {
+                MessageBoxW(
+                    windows::Win32::Foundation::HWND(wnd_unres.hwnd().ptr() as _),
+                    windows::core::PCWSTR(message_wide.as_ptr()),
+                    windows::core::PCWSTR(title_wide.as_ptr()),
+                    MESSAGEBOX_STYLE(MB_YESNO.0 | MB_ICONWARNING.0),
+                )
+            };
+            
+            if result.0 != 6 { // IDYES = 6
+                let _ = status_unres.set_text("Operation cancelled");
+                return Ok(());
+            }
+
+            // Build new PATH by removing unresolved entries
+            let mut new_entries = Vec::new();
+            for (i, orig) in state_unres.borrow().orig_paths.iter().enumerate() {
+                if !unresolved.contains(&i) {
+                    new_entries.push(orig.clone());
+                }
+            }
+            let new_path = new_entries.join(";");
+
+            // Set the new PATH
+            if path_tree::path_utils::set_path_string_for_scope(state_unres.borrow().scope, &new_path) {
+                let _ = status_unres.set_text(&format!("Removed {} unresolved entries", unresolved.len()));
+                // Refresh the tree
+                state_unres.borrow_mut().rebuild();
+                populate_tree_from_state(&tv_unres, &*state_unres.borrow())?;
+                set_window_title_with_stats(&wnd_unres, &*state_unres.borrow())?;
+                set_status_bar(&status_unres, &*state_unres.borrow())?;
+            } else {
+                let _ = status_unres.set_text("Failed to update PATH");
+            }
+            Ok(())
+        });
+
+        // Delete Marked button
+        let state_del = state.clone();
+        let tv_del = tv.clone();
+        let status_del = status.clone();
+        let wnd_del = wnd.clone();
+        let btn_del_self = btn_delete_marked.clone();
+        btn_delete_marked.on().bn_clicked(move || -> AnyResult<()> {
+            let marked = state_del.borrow().marked_for_deletion.clone();
+            if marked.is_empty() {
+                let _ = status_del.set_text("No items marked for deletion");
+                return Ok(());
+            }
+
+            // Show confirmation dialog
+            let scope_name = match state_del.borrow().scope {
+                RegistryScope::UserOnly => "User",
+                RegistryScope::SystemOnly => "System",
+                RegistryScope::ProcessOnly => "Process",
+                _ => "Unknown",
+            };
+
+            use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MESSAGEBOX_STYLE, MB_ICONWARNING, MB_YESNO};
+
+            let title = "Confirm PATH Modification";
+            let message = format!(
+                "This will remove {} marked PATH entries from the {} scope.\n\
+                Marked entries will be permanently deleted from your PATH.\n\n\
+                WARNING: This modifies your system's PATH environment variable.\n\
+                It is recommended to backup your PATH before proceeding.\n\n\
+                Do you want to continue?",
+                marked.len(), scope_name
+            );
+
+            // Convert strings to UTF-16
+            let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+            let message_wide: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+
+            let result = unsafe {
+                MessageBoxW(
+                    windows::Win32::Foundation::HWND(wnd_del.hwnd().ptr() as _),
+                    windows::core::PCWSTR(message_wide.as_ptr()),
+                    windows::core::PCWSTR(title_wide.as_ptr()),
+                    MESSAGEBOX_STYLE(MB_YESNO.0 | MB_ICONWARNING.0),
+                )
+            };
+
+            if result.0 != 6 { // IDYES = 6
+                let _ = status_del.set_text("Operation cancelled");
+                return Ok(());
+            }
+
+            // Build new PATH by removing marked entries
+            let mut new_entries = Vec::new();
+            for (i, orig) in state_del.borrow().orig_paths.iter().enumerate() {
+                if !marked.contains(&i) {
+                    new_entries.push(orig.clone());
+                }
+            }
+            let new_path = new_entries.join(";");
+
+            // Set the new PATH
+            if path_tree::path_utils::set_path_string_for_scope(state_del.borrow().scope, &new_path) {
+                let _ = status_del.set_text(&format!("Deleted {} marked entries", marked.len()));
+                // Clear marked and refresh
+                state_del.borrow_mut().marked_for_deletion.clear();
+                state_del.borrow_mut().rebuild();
+                populate_tree_from_state(&tv_del, &*state_del.borrow())?;
+                set_window_title_with_stats(&wnd_del, &*state_del.borrow())?;
+                set_status_bar(&status_del, &*state_del.borrow())?;
+                unsafe { EnableWindow(btn_del_self.hwnd().ptr() as _, 0); }
+            } else {
+                let _ = status_del.set_text("Failed to update PATH");
             }
             Ok(())
         });
